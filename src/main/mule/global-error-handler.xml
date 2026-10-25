@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd">
+	
+	<error-handler name="Global_SLA_Error_Handler" doc:id="208c4d93-de7b-44ab-b551-41738b0133b1" >
+		<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" doc:id="f0c34583-0d7c-44c1-a1f9-c493767a0c0e" >
+			<logger level="ERROR" doc:name="Log SLA Application Error" doc:id="5b96c0d1-28b8-4fb7-943b-0379b4efdefe" message='#["SLA application error. Run ID: "&#10;    ++ ((vars.runId default "N/A") as String)&#10;    ++ ". Error: "&#10;    ++ error.description]'/>
+				<db:update doc:name="Mark Run Failed" doc:id="33db63c3-5201-4165-9015-930567eebba3" config-ref="Database_Config">
+    				<db:sql><![CDATA[UPDATE sla_evaluation_runs SET run_status = 'FAILED', completed_at = CURRENT_TIMESTAMP WHERE run_id = :runId AND run_status = 'IN_PROGRESS';]]></db:sql>
+    				<db:input-parameters><![CDATA[#[{runId: vars.runId}]]]></db:input-parameters>
+				</db:update>	
+		</on-error-propagate>
+		</error-handler>
+		</mule>

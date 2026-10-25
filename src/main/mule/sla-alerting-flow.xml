@@ -1,0 +1,1225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+	xmlns:email="http://www.mulesoft.org/schema/mule/email"
+	xmlns:vm="http://www.mulesoft.org/schema/mule/vm" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+	
+	
+	<flow name="sla-evaluation-flow" doc:id="30576bff-b84a-4abf-a5cd-95968efa3a46" >
+		<scheduler
+    		doc:name="Scheduler"
+    		doc:id="f7d79eac-ef90-4bac-9be6-fafff98daaa5"
+   	 		disallowConcurrentExecution="true">
+    		<scheduling-strategy>
+        		<fixed-frequency
+            		frequency="${notification.scheduleFrequencyMins}"
+            		timeUnit="MINUTES"
+            		startDelay="0"/>
+    		</scheduling-strategy>
+		</scheduler>
+		<set-variable variableName="slaPolicy" value='#[readUrl("classpath://sla-policy.yaml", "application/yaml")]' doc:name="Load SLA Policy Configuration"/>
+		<set-variable value="#[uuid()]" doc:name="Generate Evaluation Run ID" doc:id="f2b76d1b-e2b7-4d16-9a73-49637f50c4c7" variableName="runId"/>
+		<set-variable value="#[vars.slaPolicy.ticketExtraction.fetchSize as Number]" doc:name="Initialize Ticket Page Size" doc:id="681e6e37-18f2-4313-bb3e-125f3dbe2022" variableName="fetchSize"/>
+		<until-successful maxRetries="3" doc:name="Retry Ticket Count Query" doc:id="60f8a417-967d-4fbd-82a4-99de15aa353c" millisBetweenRetries="2000">
+			<db:select doc:name="Count Open Tickets for Pagination" doc:id="3cdc94ab-91c6-4d70-b16a-9723e80650fa" config-ref="Database_Config">
+			<db:sql><![CDATA[SELECT COUNT(DISTINCT t.ticket_id) AS total_count
+FROM public.tickets t
+JOIN public.customers c
+    ON c.customer_id = t.customer_id
+JOIN public.sla_policies p
+    ON p.priority = t.priority
+   AND p.customer_tier = c.customer_tier
+WHERE t.ticket_status IN (
+    'OPEN',
+    'IN_PROGRESS',
+    'AWAITING_INTERNAL'
+)
+AND t.resolved_at IS NULL;]]></db:sql>
+		</db:select>
+		</until-successful>
+		<set-variable value="#[payload[0].total_count as Number]" doc:name="Store Total Ticket Count" doc:id="85095694-d043-41fb-ba46-2313cd07a4a6" variableName="totalTickets"/>
+		<set-variable value="#[if (vars.totalTickets &lt;= 0)&#10;    []&#10;else&#10;    (0 to (ceil(vars.totalTickets / vars.fetchSize) - 1))&#10;        map ((pageNumber) -&gt; pageNumber * vars.fetchSize)]" doc:name="Build Ticket Page Offsets" doc:id="6e7ac3b5-57c0-41cf-b5e7-0cc0625449bd" variableName="pageOffsets"/>
+		<db:insert doc:name="Create SLA Run Audit Record" doc:id="681da0d4-9bd2-4586-b6da-00f817330a5d" config-ref="Database_Config">
+			<db:sql><![CDATA[INSERT INTO public.sla_evaluation_runs (
+    run_id,
+    started_at,
+    completed_at,
+    evaluated_count,
+    on_track_count,
+    at_risk_count,
+    breached_count,
+    severe_count,
+    escalated_count,
+    events_published,
+    digests_sent,
+    suppressed_count,
+    run_status,
+    correlation_id
+)
+VALUES (
+    :runId,
+    NOW(),
+    NULL,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,
+    'RUNNING',
+    :runId
+);]]></db:sql>
+			<db:input-parameters><![CDATA[#[{
+    runId: vars.runId as String
+}]]]></db:input-parameters>
+		</db:insert>
+		<set-variable value="#[{&#10;    evaluatedCount: 0,&#10;    onTrackCount: 0,&#10;    atRiskCount: 0,&#10;    breachedCount: 0,&#10;    severeCount: 0&#10;}]" doc:name="Initialize SLA Audit Counters" doc:id="a2d84c25-e456-44ce-9ff6-f5cdc0c51eb2" variableName="auditCounts"/>
+		<foreach doc:name="For Each Ticket Page" doc:id="f3a38955-22c1-4216-8bf1-a99356dbfcd5" collection="#[vars.pageOffsets]">
+			<set-variable value="#[payload]" doc:name="Set Current Ticket Page Offset" doc:id="78e29f46-e102-4584-8f5a-06a10893263f" variableName="offset"/>
+			<until-successful maxRetries="3" doc:name="Retry Main Ticket Select" doc:id="8312c0fd-450d-434a-b024-a6e04b331cbd" millisBetweenRetries="2000">
+				<db:select doc:name="Select" doc:id="904ebdad-047b-4d87-ac3e-1d6461401559" config-ref="Database_Config" target="pageTickets" queryTimeout="30">
+			<db:sql><![CDATA[
+SELECT
+    t.ticket_id,
+    t.subject,
+    t.priority,
+    t.ticket_status,
+    t.created_at,
+    t.first_response_at,
+    t.resolved_at,
+    t.customer_id,
+    c.customer_tier,
+    t.assigned_agent_id,
+    a.manager_id,
+    m.manager_email,
+    m.manager_status,
+    p.first_response_target_mins,
+    p.resolution_target_mins,
+    p.business_calendar_code,
+    COALESCE(s.last_alert_level_response, 0)
+        AS last_alert_level_response,
+    COALESCE(s.last_alert_level_resolution, 0)
+        AS last_alert_level_resolution,
+    COALESCE(ph.pause_intervals_json, '[]')
+        AS pause_intervals_json
+FROM public.tickets t
+JOIN public.customers c
+    ON c.customer_id = t.customer_id
+JOIN public.sla_policies p
+    ON p.priority = t.priority
+   AND p.customer_tier = c.customer_tier
+LEFT JOIN public.agents a
+    ON a.agent_id = t.assigned_agent_id
+LEFT JOIN public.managers m
+    ON m.manager_id = a.manager_id
+LEFT JOIN public.ticket_sla_state s
+    ON s.ticket_id = t.ticket_id
+LEFT JOIN (
+    SELECT
+        ticket_id,
+        json_agg(
+            json_build_object(
+                'paused_from', paused_from,
+                'paused_to', paused_to
+            )
+            ORDER BY paused_from
+        )::text AS pause_intervals_json
+    FROM public.ticket_pause_history
+    WHERE pause_status IN (
+        'AWAITING_CUSTOMER',
+        'PENDING_THIRD_PARTY',
+        'ON_HOLD_APPROVED'
+    )
+    GROUP BY ticket_id
+) ph
+    ON ph.ticket_id = t.ticket_id
+WHERE t.ticket_status IN (
+    'OPEN',
+    'IN_PROGRESS',
+    'AWAITING_INTERNAL'
+)
+AND t.resolved_at IS NULL
+ORDER BY t.priority, t.created_at
+LIMIT :fetchSize OFFSET :offset;
+]]></db:sql>
+			<db:input-parameters><![CDATA[#[{
+    fetchSize: vars.fetchSize,
+    offset: vars.offset
+}]]]></db:input-parameters>
+		</db:select>
+			</until-successful>
+			<set-payload value="#[vars.pageTickets]" doc:name="Restore Selected Ticket Page" doc:id="fe1567fa-bf6e-4de8-92f6-d8a3dbff87cb" />
+			<ee:transform doc:name="Transform Message" doc:id="265e1912-94f1-4416-a4bd-f33f206a3526">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map (ticket) -> do {
+    var policyMatches =
+        vars.slaPolicy.slaPolicies filter ((p) ->
+            p.priority == ticket.priority
+            and p.customerTier == ticket.customer_tier
+        )
+
+    var policy =
+        policyMatches[0]
+
+    var calendar =
+        vars.slaPolicy.businessCalendars[policy.calendar]
+
+    var thresholds =
+        vars.slaPolicy.thresholds
+
+    var currentTime =
+        (now() >> calendar.timeZone) as LocalDateTime
+
+    // Database TIMESTAMP values are interpreted as UTC,
+    // then converted into the SLA calendar's local time.
+    fun toCalendarLocalDateTime(value, timeZone) =
+        if (value == null)
+            null
+        else
+            (((value as LocalDateTime) ++ |Z|) >> timeZone)
+                as LocalDateTime
+
+    var createdDateTime =
+        if (ticket.created_at != null)
+            toCalendarLocalDateTime(
+                ticket.created_at,
+                calendar.timeZone
+            )
+        else
+            currentTime
+
+    var responseReceived =
+        ticket.first_response_at != null
+
+    var responseEnd =
+        if (responseReceived)
+            toCalendarLocalDateTime(
+                ticket.first_response_at,
+                calendar.timeZone
+            )
+        else
+            currentTime
+
+    var resolutionComplete =
+        ticket.resolved_at != null
+
+    var resolutionEnd =
+        if (resolutionComplete)
+            toCalendarLocalDateTime(
+                ticket.resolved_at,
+                calendar.timeZone
+            )
+        else
+            currentTime
+
+    var responseTarget =
+        (policy.firstResponseTargetMins default 0) as Number
+
+    var resolutionTarget =
+        (policy.resolutionTargetMins default 0) as Number
+
+    var pauseIntervals =
+        read(
+            (ticket.pause_intervals_json default "[]"),
+            "application/json"
+        )
+
+    fun businessMinutes(startLdt, endLdt, cal) =
+        if (endLdt <= startLdt)
+            0
+        else do {
+            var startDate = startLdt as Date
+            var endDate = endLdt as Date
+            var dayCount = daysBetween(startDate, endDate)
+
+            var dates =
+                (0 to dayCount) map ((offset) ->
+                    startDate +
+                    (("P" ++ (offset as String) ++ "D") as Period)
+                )
+
+            ---
+            sum(dates map ((dayDate) -> do {
+                var dayName =
+                    ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+                        [dayDate.dayOfWeek - 1]
+
+                var dateText =
+                    dayDate as String {format: "yyyy-MM-dd"}
+
+                var openTime =
+                    cal.workingHours.start as LocalTime {format: "HH:mm"}
+
+                var closeTime =
+                    cal.workingHours.end as LocalTime {format: "HH:mm"}
+
+                var dayOpen =
+                    dayDate ++ openTime
+
+                var dayClose =
+                    if (
+                        cal.workingHours.start == "00:00"
+                        and cal.workingHours.end == "23:59"
+                    )
+                        (dayDate + |P1D|) ++
+                            ("00:00" as LocalTime {format: "HH:mm"})
+                    else
+                        dayDate ++ closeTime
+
+                var clippedStart =
+                    if (startLdt > dayOpen)
+                        startLdt
+                    else
+                        dayOpen
+
+                var clippedEnd =
+                    if (endLdt < dayClose)
+                        endLdt
+                    else
+                        dayClose
+
+                var isWorkingDay =
+                    cal.workingDays contains dayName
+
+                var isHoliday =
+                    (cal.holidays default []) contains dateText
+
+                ---
+                if (
+                    isWorkingDay
+                    and not isHoliday
+                    and clippedEnd > clippedStart
+                )
+                    (
+                        (clippedEnd - clippedStart)
+                            as Number {unit: "milliseconds"}
+                    ) / 60000
+                else
+                    0
+            }))
+        }
+
+    fun pausedBusinessMinutes(startLdt, endLdt, intervals, cal) =
+        if (endLdt <= startLdt or isEmpty(intervals))
+            0
+        else
+            sum(intervals map ((pause) -> do {
+                var pauseStart =
+                    toCalendarLocalDateTime(
+                        pause.paused_from,
+                        cal.timeZone
+                    )
+
+                var pauseEnd =
+                    if (pause.paused_to != null)
+                        toCalendarLocalDateTime(
+                            pause.paused_to,
+                            cal.timeZone
+                        )
+                    else
+                        endLdt
+
+                var clippedStart =
+                    if (pauseStart > startLdt)
+                        pauseStart
+                    else
+                        startLdt
+
+                var clippedEnd =
+                    if (pauseEnd < endLdt)
+                        pauseEnd
+                    else
+                        endLdt
+
+                ---
+                businessMinutes(
+                    clippedStart,
+                    clippedEnd,
+                    cal
+                )
+            }))
+
+    var responseBusinessMinutes =
+        businessMinutes(
+            createdDateTime,
+            responseEnd,
+            calendar
+        )
+
+    var resolutionBusinessMinutes =
+        businessMinutes(
+            createdDateTime,
+            resolutionEnd,
+            calendar
+        )
+
+    var responsePausedMinutes =
+        pausedBusinessMinutes(
+            createdDateTime,
+            responseEnd,
+            pauseIntervals,
+            calendar
+        )
+
+    var resolutionPausedMinutes =
+        pausedBusinessMinutes(
+            createdDateTime,
+            resolutionEnd,
+            pauseIntervals,
+            calendar
+        )
+
+    var responseElapsed =
+        max([0, responseBusinessMinutes - responsePausedMinutes])
+
+    var resolutionElapsed =
+        max([0, resolutionBusinessMinutes - resolutionPausedMinutes])
+
+    var responsePercent =
+        if (responseTarget > 0)
+            responseElapsed / responseTarget * 100
+        else
+            0
+
+    var resolutionPercent =
+        if (resolutionTarget > 0)
+            resolutionElapsed / resolutionTarget * 100
+        else
+            0
+
+    fun band(percent) =
+        if (
+            percent >=
+            (
+                (thresholds.breachPercent as Number)
+                * (thresholds.severeMultiplier as Number)
+            )
+        )
+            "SEVERELY_BREACHED"
+        else if (percent >= (thresholds.breachPercent as Number))
+            "BREACHED"
+        else if (percent >= (thresholds.atRiskPercent as Number))
+            "AT_RISK"
+        else
+            "ON_TRACK"
+
+    fun alertLevel(slaBand: String): Number =
+        if (slaBand == "SEVERELY_BREACHED")
+            3
+        else if (slaBand == "BREACHED")
+            2
+        else if (slaBand == "AT_RISK")
+            1
+        else
+            0
+
+    ---
+    {
+        ticket_id: ticket.ticket_id,
+        subject: ticket.subject,
+        priority: ticket.priority,
+        ticket_status: ticket.ticket_status,
+
+        created_at: ticket.created_at,
+        first_response_at: ticket.first_response_at,
+        resolved_at: ticket.resolved_at,
+
+        customer_id: ticket.customer_id,
+        customer_tier: ticket.customer_tier,
+        assigned_agent_id: ticket.assigned_agent_id,
+        manager_id: ticket.manager_id,
+        manager_email: ticket.manager_email,
+        manager_status: ticket.manager_status,
+
+        business_calendar_code: policy.calendar,
+
+        first_response_target_mins: responseTarget,
+        resolution_target_mins: resolutionTarget,
+
+        response_received: responseReceived,
+        resolution_complete: resolutionComplete,
+
+        response_elapsed_mins: responseElapsed,
+        resolution_elapsed_mins: resolutionElapsed,
+
+        response_percent: responsePercent,
+        resolution_percent: resolutionPercent,
+
+        response_band: band(responsePercent),
+        resolution_band: band(resolutionPercent),
+
+        current_alert_level_response:
+            alertLevel(band(responsePercent)),
+
+        current_alert_level_resolution:
+            alertLevel(band(resolutionPercent)),
+
+        last_alert_level_response:
+            ticket.last_alert_level_response default 0,
+
+        last_alert_level_resolution:
+            ticket.last_alert_level_resolution default 0,
+
+        paused_minutes: resolutionPausedMinutes
+    }
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+			<set-variable value="#[payload]" doc:name="Store Evaluated Tickets" doc:id="ee0480a7-d63f-42ab-a2c2-aea2d9e96234" variableName="evaluatedTickets" />
+			<foreach doc:name="For Each Open Ticket" doc:id="643d919b-e2c6-4c94-91b7-474a938b46b6" collection="#[vars.evaluatedTickets]">
+			<set-variable value="#[payload]" doc:name="Store Current Evaluated Ticket" doc:id="a9880f24-80aa-49d3-bd71-79d597f49c50" variableName="currentTicket"/>
+				<set-variable value='#[output application/java ---&#10;vars.auditCounts ++ {&#10;    evaluatedCount: vars.auditCounts.evaluatedCount + 1,&#10;    onTrackCount: vars.auditCounts.onTrackCount +&#10;        (if (payload.response_band == "ON_TRACK" and payload.resolution_band == "ON_TRACK") 1 else 0),&#10;    atRiskCount: vars.auditCounts.atRiskCount +&#10;        (if (payload.response_band == "AT_RISK" or payload.resolution_band == "AT_RISK") 1 else 0),&#10;    breachedCount: vars.auditCounts.breachedCount +&#10;        (if (payload.response_band == "BREACHED" or payload.resolution_band == "BREACHED") 1 else 0),&#10;    severeCount: vars.auditCounts.severeCount +&#10;        (if (payload.response_band == "SEVERELY_BREACHED" or payload.resolution_band == "SEVERELY_BREACHED") 1 else 0)&#10;}]' doc:name="Accumulate SLA Audit Counts" doc:id="8c67c08b-afe0-45eb-9987-a4dcdfd2ba41" variableName="auditCounts"/>
+				<until-successful maxRetries="3" doc:name="Retry New SLA Alert Record" doc:id="fe4991ca-9496-4165-91f7-c6b274e2a662" millisBetweenRetries="2000">
+					<db:insert doc:name="New SLA Alert Record" doc:id="e37ee51c-f922-45ec-9c29-40f32a45873c" config-ref="Database_Config" target="alertLogResult">
+				<db:sql><![CDATA[
+INSERT INTO public.sla_alert_log (
+    run_id,
+    ticket_id,
+    clock_type,
+    from_level,
+    to_level,
+    band,
+    event_published,
+    email_status,
+    suppressed_reason,
+    alerted_at
+)
+SELECT
+    :runId,
+    :ticketId,
+    'RESPONSE',
+    :lastResponseLevel,
+    :currentResponseLevel,
+    :responseBand,
+    FALSE,
+    'PENDING',
+    NULL,
+    NOW()
+WHERE :currentResponseLevel > :lastResponseLevel
+
+UNION ALL
+
+SELECT
+    :runId,
+    :ticketId,
+    'RESOLUTION',
+    :lastResolutionLevel,
+    :currentResolutionLevel,
+    :resolutionBand,
+    FALSE,
+    'PENDING',
+    NULL,
+    NOW()
+WHERE :currentResolutionLevel > :lastResolutionLevel
+
+ON CONFLICT (ticket_id, clock_type, to_level)
+DO NOTHING;
+]]></db:sql>
+				<db:input-parameters><![CDATA[#[{
+    runId: vars.runId,
+    ticketId: vars.currentTicket.ticket_id,
+    lastResponseLevel: vars.currentTicket.last_alert_level_response,
+    currentResponseLevel: vars.currentTicket.current_alert_level_response,
+    responseBand: vars.currentTicket.response_band,
+    lastResolutionLevel: vars.currentTicket.last_alert_level_resolution,
+    currentResolutionLevel: vars.currentTicket.current_alert_level_resolution,
+    resolutionBand: vars.currentTicket.resolution_band
+}]]]></db:input-parameters>
+			</db:insert>
+				</until-successful>
+			<until-successful maxRetries="3" doc:name="Retry Ticket SLA State Upsert" doc:id="f0c82851-47dd-4b2a-a75c-ec716f234666" millisBetweenRetries="2000">
+					<db:insert doc:name="Ticket SLA State" doc:id="3694aa78-49b8-4acd-b6c3-d15cf9698917" config-ref="Database_Config">
+				<db:sql><![CDATA[
+INSERT INTO public.ticket_sla_state (
+    ticket_id,
+    response_elapsed_mins,
+    resolution_elapsed_mins,
+    response_band,
+    resolution_band,
+    last_alert_level_response,
+    last_alert_level_resolution,
+    last_alerted_at,
+    last_evaluated_run_id
+)
+VALUES (
+    :ticketId,
+    :responseElapsed,
+    :resolutionElapsed,
+    :responseBand,
+    :resolutionBand,
+    :currentResponseLevel,
+    :currentResolutionLevel,
+    CASE
+        WHEN :currentResponseLevel > :lastResponseLevel
+          OR :currentResolutionLevel > :lastResolutionLevel
+        THEN NOW()
+        ELSE NULL
+    END,
+    :runId
+)
+ON CONFLICT (ticket_id)
+DO UPDATE SET
+    response_elapsed_mins = EXCLUDED.response_elapsed_mins,
+    resolution_elapsed_mins = EXCLUDED.resolution_elapsed_mins,
+    response_band = EXCLUDED.response_band,
+    resolution_band = EXCLUDED.resolution_band,
+
+    last_alert_level_response = GREATEST(
+        COALESCE(
+            ticket_sla_state.last_alert_level_response, 0
+        ),
+        COALESCE(
+            EXCLUDED.last_alert_level_response, 0
+        )
+    ),
+
+    last_alert_level_resolution = GREATEST(
+        COALESCE(
+            ticket_sla_state.last_alert_level_resolution, 0
+        ),
+        COALESCE(
+            EXCLUDED.last_alert_level_resolution, 0
+        )
+    ),
+
+    last_alerted_at = CASE
+        WHEN COALESCE(EXCLUDED.last_alert_level_response, 0) >
+             COALESCE(
+                 ticket_sla_state.last_alert_level_response, 0
+             )
+          OR COALESCE(EXCLUDED.last_alert_level_resolution, 0) >
+             COALESCE(
+                 ticket_sla_state.last_alert_level_resolution, 0
+             )
+        THEN NOW()
+        ELSE ticket_sla_state.last_alerted_at
+    END,
+
+    last_evaluated_run_id = EXCLUDED.last_evaluated_run_id;
+
+]]></db:sql>
+				<db:input-parameters><![CDATA[#[{
+    ticketId: vars.currentTicket.ticket_id,
+    responseElapsed: vars.currentTicket.response_elapsed_mins,
+    resolutionElapsed: vars.currentTicket.resolution_elapsed_mins,
+    responseBand: vars.currentTicket.response_band,
+    resolutionBand: vars.currentTicket.resolution_band,
+    currentResponseLevel: vars.currentTicket.current_alert_level_response,
+    currentResolutionLevel: vars.currentTicket.current_alert_level_resolution,
+    lastResponseLevel: vars.currentTicket.last_alert_level_response,
+    lastResolutionLevel: vars.currentTicket.last_alert_level_resolution,
+    runId: vars.runId
+}]]]></db:input-parameters>
+			</db:insert>
+				</until-successful>
+		</foreach>
+		</foreach>
+		<db:update doc:name="Complete SLA Run Audit" doc:id="cf219fc9-c95f-4609-a4b3-9cae94bae8cd" config-ref="Database_Config">
+			<db:sql ><![CDATA[UPDATE public.sla_evaluation_runs
+SET
+    evaluated_count = :evaluatedCount,
+    on_track_count = :onTrackCount,
+    at_risk_count = :atRiskCount,
+    breached_count = :breachedCount,
+    severe_count = :severeCount,
+    escalated_count = (
+        SELECT COUNT(*)
+        FROM public.sla_alert_log
+        WHERE run_id = :runId
+    ),
+    completed_at = NOW(),
+    run_status = 'COMPLETED',
+    correlation_id = COALESCE(correlation_id, :runId)
+WHERE run_id = :runId
+  AND run_status = 'RUNNING';]]></db:sql>
+			<db:input-parameters ><![CDATA[#[{
+    runId: vars.runId as String,
+    evaluatedCount: vars.auditCounts.evaluatedCount,
+    onTrackCount: vars.auditCounts.onTrackCount,
+    atRiskCount: vars.auditCounts.atRiskCount,
+    breachedCount: vars.auditCounts.breachedCount,
+    severeCount: vars.auditCounts.severeCount
+}]]]></db:input-parameters>
+		</db:update>
+		<logger level="INFO" doc:name="Logger" doc:id="34f54c05-ff5b-4b2c-8583-919ff93c7ff5" message='#[write(payload, "application/json")]'/>
+	</flow>
+	<flow name="sla-alert-dispatcher-flow" maxConcurrency="1" doc:id="345ead96-1ddd-428c-9c0d-ce5269e2277d" >
+		<scheduler doc:name="Scheduler" doc:id="8bb35568-2b54-4e55-850f-e487f01a1414" >
+			<scheduling-strategy >
+				<fixed-frequency frequency="${notification.dispatchFrequencyMins}" timeUnit="MINUTES"/>
+			</scheduling-strategy>
+		</scheduler>
+		<logger level="INFO"
+        doc:name="DEBUG - Dispatcher Started"
+        message="DISPATCHER_STARTED"/>
+		<db:update doc:name="Cancel Resolved Pending Alerts"
+           config-ref="Database_Config">
+    <db:sql><![CDATA[
+UPDATE public.sla_alert_log al
+SET
+    email_status = 'CANCELLED_RESOLVED',
+    suppressed_reason = 'Ticket resolved before notification'
+FROM public.tickets t
+WHERE al.ticket_id = t.ticket_id
+  AND al.event_published = FALSE
+  AND COALESCE(al.email_status, 'PENDING') IN (
+      'PENDING',
+      'RECOVERY_PENDING',
+      'RECOVERY_QUEUED'
+  )
+  AND (
+      t.resolved_at IS NOT NULL
+      OR t.ticket_status NOT IN (
+          'OPEN',
+          'IN_PROGRESS',
+          'AWAITING_INTERNAL'
+      )
+  );
+    ]]></db:sql>
+</db:update>
+		<db:select doc:name="Select Pending SLA Alerts" doc:id="89119bd6-b080-4c53-9347-ae81e81cc3fa" config-ref="Database_Config">
+			<db:sql ><![CDATA[SELECT
+    alert_seq,
+    run_id,
+    ticket_id,
+    clock_type,
+    to_level,
+    band
+FROM public.sla_alert_log
+WHERE event_published = FALSE
+  AND ticket_id NOT IN (
+      SELECT ticket_id
+      FROM public.tickets
+      WHERE ticket_status IN (
+          'RESOLVED',
+          'CLOSED',
+          'CANCELLED_RESOLVED'
+      )
+      OR resolved_at IS NOT NULL
+  );
+]]></db:sql>
+		</db:select>
+		<logger level="INFO"
+        doc:name="DEBUG - Pending Alerts Result"
+        message="#['PENDING_ALERTS_RESULT: ' ++ write(payload, 'application/json')]"/>	
+		<foreach doc:name="For Each Pending SLA Alert" doc:id="ccb423e6-17f4-4473-82a4-29d5011eeab0" >
+			<set-variable value="#[payload]" doc:name="Store Current Alert" doc:id="eaa7b5ea-9f67-40a0-9dee-21a19715a889" variableName="currentAlert"/>
+			<logger level="INFO"
+        			doc:name="DEBUG - Dispatcher About to Publish"
+        			message="#['DISPATCHER_ABOUT_TO_PUBLISH: alert_seq=' ++ (vars.currentAlert.alert_seq as String) ++ ', run_id=' ++ (vars.currentAlert.run_id as String)]"/>
+			<until-successful maxRetries="3" doc:name="Retry SLA Alert Event Publish" doc:id="a0e0980c-29df-437a-a074-89d946f4cf76" millisBetweenRetries="2000">
+				<vm:publish queueName="sla-alert-queue" doc:name="Publish SLA Alert Event" doc:id="835ae564-26a5-4ccd-b1fe-eae46b92db12" config-ref="VM_Config">
+				<vm:content><![CDATA[#[vars.currentAlert]]]></vm:content>
+			</vm:publish>
+			</until-successful>
+			<db:update doc:name="Mark SLA Alert Published" doc:id="843291d1-1940-4e5b-8c8c-5f497555e646" config-ref="Database_Config">
+				<db:sql ><![CDATA[
+UPDATE public.sla_alert_log
+SET event_published = TRUE
+WHERE alert_seq = :alertSeq
+  AND event_published = FALSE;
+]]></db:sql>
+				<db:input-parameters ><![CDATA[#[{
+  alertSeq: vars.currentAlert.alert_seq
+}]]]></db:input-parameters>
+			</db:update>
+			<db:update doc:name="Increment Published Event Audit" doc:id="6c377878-dde7-4b0c-afb0-bc72510bca37" config-ref="Database_Config">
+				<db:sql ><![CDATA[UPDATE public.sla_evaluation_runs
+SET events_published = COALESCE(events_published, 0) + 1
+WHERE run_id = :runId;]]></db:sql>
+				<db:input-parameters><![CDATA[#[{
+    runId: vars.currentAlert.run_id as String
+}]]]></db:input-parameters>
+			</db:update>
+		</foreach>
+	</flow>
+	<flow name="sla-quiet-hours-recovery-flow" doc:id="6939e775-5169-44f8-9153-3d41aadc275e">
+		<scheduler doc:name="Quiet Hours Recovery Scheduler" doc:id="4703437b-9250-4aeb-bb1d-70c4b465ae3e" >
+			<scheduling-strategy >
+				<fixed-frequency frequency="${notification.recoveryFrequencyMins}" timeUnit="MINUTES"/>
+			</scheduling-strategy>
+		</scheduler>
+		<choice doc:name="Choice" doc:id="14a46ae3-335a-4a94-aab5-34f000776511" >
+			<when expression="#[((now() >> 'Asia/Kolkata') as String {format: 'HH:mm'}) >= p('notification.quietHoursEnd') and ((now() >> 'Asia/Kolkata') as String {format: 'HH:mm'}) &lt; p('notification.quietHoursStart')]">
+				<db:select doc:name="Select" doc:id="ffa30349-2ac6-428e-b10a-64d4a72fb4c9" config-ref="Database_Config">
+					<db:sql ><![CDATA[SELECT
+    run_id,
+    MIN(alert_seq) AS alert_seq
+FROM public.sla_alert_log
+WHERE (
+        email_status = 'SUPPRESSED'
+        AND suppressed_reason = 'Quiet hours'
+      )
+   OR email_status = 'RECOVERY_PENDING'
+GROUP BY run_id
+ORDER BY MIN(alert_seq);]]></db:sql>
+				</db:select>
+				<foreach doc:name="For Each Recovery Candidate" doc:id="3a003d9e-e7bc-43fc-b10d-7ce6b86184c4" collection="#[payload]">
+					<set-variable value="#[payload]" doc:name="Store Recovery Run" doc:id="9bd52782-60b8-4e42-9609-874b3e82911b" variableName="recoveryRun"/>
+					<db:update doc:name="Prepare Suppressed Digest Recovery" doc:id="1a535868-1031-482c-a2f9-ad5af0c5ea31" config-ref="Database_Config">
+						<db:sql ><![CDATA[UPDATE public.sla_alert_log
+SET
+    email_status = 'RECOVERY_PENDING',
+    processing_token = NULL
+WHERE run_id = :runId
+  AND (
+      (email_status = 'SUPPRESSED'
+       AND suppressed_reason = 'Quiet hours')
+      OR email_status = 'RECOVERY_PENDING'
+  );]]></db:sql>
+						<db:input-parameters ><![CDATA[#[{
+    runId: vars.recoveryRun.run_id
+}]]]></db:input-parameters>
+					</db:update>
+					<set-payload value="#[{&#10;    run_id: vars.recoveryRun.run_id,&#10;    alert_seq: vars.recoveryRun.alert_seq,&#10;    isRecovery: true&#10;}]" doc:name="Set Payload" doc:id="9acb4dc2-72ae-4ea3-acbb-ad7d8845a6fa" />
+					<vm:publish doc:name="Publish Quiet Hours Recovery" doc:id="d2e4b974-d6ff-4d32-b862-f798458f747f" config-ref="VM_Config" queueName="sla-alert-queue"/>
+					<db:update doc:name="Mark Recovery Queued" doc:id="ab320b61-c326-4f4a-92ab-b86119e2ffb3" config-ref="Database_Config">
+						<db:sql ><![CDATA[UPDATE public.sla_alert_log
+SET email_status = 'RECOVERY_QUEUED'
+WHERE run_id = :runId
+  AND email_status = 'RECOVERY_PENDING';]]></db:sql>
+						<db:input-parameters ><![CDATA[#[{
+    runId: vars.recoveryRun.run_id
+}]]]></db:input-parameters>
+					</db:update>
+				</foreach>
+			</when>
+		</choice>
+	</flow>
+	<flow name="sla-alert-consumer-flow" maxConcurrency="1" doc:id="6ce83ead-44a7-427d-9d6f-7f1d30122797" >
+		<vm:listener queueName="sla-alert-queue" doc:name="Listen for SLA Alert Events" doc:id="d5dd1c9d-efe2-4119-b892-44d52a8a3703" config-ref="VM_Config" numberOfConsumers="1"/>
+		<logger level="INFO"
+        doc:name="DEBUG - Consumer Received Alert"
+        message="#['CONSUMER_RECEIVED_ALERT: ' ++ write(payload, 'application/json')]"/>
+		<set-variable value="#[readUrl('classpath://sla-policy.yaml', 'application/yaml')]" doc:name="Load SLA Policy" doc:id="44a143d5-0a6b-4c40-8cc5-2c1e6642f696" variableName="slaPolicy"/>
+		<set-variable value="#[payload]" doc:name="Set Variable" doc:id="ae3b4d0e-0fb2-4562-b2d5-195a9cd78305" variableName="currentAlert"/>
+		<db:update doc:name="Cancel Alerts for Resolved Tickets"
+           config-ref="Database_Config">
+    <db:sql><![CDATA[
+UPDATE public.sla_alert_log al
+SET
+    email_status = 'CANCELLED_RESOLVED',
+    suppressed_reason = 'Ticket resolved before notification'
+FROM public.tickets t
+WHERE al.ticket_id = t.ticket_id
+  AND al.run_id = :runId
+  AND al.email_status IN (
+      'PENDING',
+      'RECOVERY_PENDING',
+      'RECOVERY_QUEUED',
+      'PROCESSING',
+      'SUPPRESSED'
+  )
+  AND (
+      t.resolved_at IS NOT NULL
+      OR t.ticket_status IN (
+          'RESOLVED',
+          'CLOSED',
+          'CANCELLED_RESOLVED'
+      )
+  );
+]]></db:sql>
+    <db:input-parameters><![CDATA[#[{
+        runId: vars.currentAlert.run_id as String
+    }]]]></db:input-parameters>
+</db:update>
+<db:update doc:name="Claim Pending Digest Alerts" doc:id="59b3992c-4b28-4799-8dbe-2a3496765d32" config-ref="Database_Config">
+			<db:sql ><![CDATA[
+UPDATE public.sla_alert_log
+SET
+    email_status = 'PROCESSING',
+    processing_token = :claimToken
+WHERE alert_seq = :alertSeq
+  AND run_id = :runId
+  AND email_status IN (
+      'PENDING',
+      'RECOVERY_PENDING',
+      'RECOVERY_QUEUED'
+  );
+]]></db:sql>
+			<db:input-parameters ><![CDATA[#[{
+    alertSeq: vars.currentAlert.alert_seq,
+    runId: vars.currentAlert.run_id,
+    claimToken: "RUN-" ++ (vars.currentAlert.run_id as String)
+}]]]></db:input-parameters>
+		</db:update>
+		<choice doc:name="Check Alert Claim Result" doc:id="aeb3dc46-c16f-408a-ad9c-bbd0eaa5b7d5" >
+			<when expression="#[payload.affectedRows &gt; 0]">
+				<db:select doc:name="Select" doc:id="8637394c-b75c-4785-b2f0-6f13d17c7555" config-ref="Database_Config">
+			<db:sql><![CDATA[SELECT
+    al.alert_seq,
+    al.run_id,
+    al.ticket_id,
+    al.clock_type,
+    al.from_level,
+    al.to_level,
+    al.band,
+    al.alerted_at,
+    t.subject,
+    t.priority,
+    c.customer_tier,
+    t.assigned_agent_id,
+    a.manager_id,
+    m.manager_name,
+    m.manager_email,
+    m.manager_status,
+    p.business_calendar_code,
+    CASE
+        WHEN al.clock_type = 'RESPONSE'
+            THEN p.first_response_target_mins
+        ELSE p.resolution_target_mins
+    END AS target_minutes,
+    CASE
+        WHEN al.clock_type = 'RESPONSE'
+            THEN s.response_elapsed_mins
+        ELSE s.resolution_elapsed_mins
+    END AS elapsed_business_minutes
+FROM public.sla_alert_log al
+JOIN public.tickets t
+    ON t.ticket_id = al.ticket_id
+JOIN public.customers c
+    ON c.customer_id = t.customer_id
+LEFT JOIN public.agents a
+    ON a.agent_id = t.assigned_agent_id
+LEFT JOIN public.managers m
+    ON m.manager_id = a.manager_id
+JOIN public.sla_policies p
+    ON p.priority = t.priority
+   AND p.customer_tier = c.customer_tier
+JOIN public.ticket_sla_state s
+    ON s.ticket_id = al.ticket_id
+WHERE al.run_id = :runId
+  AND al.email_status = 'PROCESSING'
+  AND al.processing_token = :claimToken
+ORDER BY al.alerted_at, al.alert_seq;]]></db:sql>
+			<db:input-parameters><![CDATA[#[{
+    alertSeq: vars.currentAlert.alert_seq,
+    runId: vars.currentAlert.run_id,
+    claimToken: "RUN-" ++ (vars.currentAlert.run_id as String)
+}]]]></db:input-parameters>
+		</db:select>
+				<ee:transform doc:name="Transform Message" doc:id="f0e060fb-f7e6-4edd-8c90-94c1fde70e54">
+			<ee:message>
+				<ee:set-payload><![CDATA[
+%dw 2.0
+output application/java
+
+var alerts = payload default []
+var fallbackEmail = vars.slaPolicy.notification.fallbackDistributionList
+
+var normalizedAlerts = alerts map (a) -> do {
+    var needsFallback =
+        a.manager_id == null
+        or isEmpty((a.manager_email default "") as String)
+        or upper((a.manager_status default "") as String) != "ACTIVE"
+    ---
+    {
+        alert: a,
+        recipientKey: if (needsFallback)
+            "FALLBACK"
+        else
+            a.manager_id as String,
+        usesFallback: needsFallback
+    }
+}
+
+---
+(normalizedAlerts groupBy ((item) -> item.recipientKey))
+    pluck ((items, recipientKey) -> do {
+        var managerAlerts = items map ((item) -> item.alert)
+        var maxTickets = (vars.slaPolicy.notification.maxTicketsPerDigest default 50) as Number
+
+        var orderedAlerts = managerAlerts orderBy ((a) ->
+            if (a.band == "SEVERELY_BREACHED") 0
+            else if (a.band == "BREACHED") 1
+            else if (a.band == "AT_RISK") 2
+            else 3
+        )
+
+        var digestAlerts = orderedAlerts filter ((alert, index) -> index < maxTickets)
+        var useFallback = items[0].usesFallback
+        ---
+        {
+            managerId: if (useFallback)
+                "FALLBACK"
+            else
+                managerAlerts[0].manager_id,
+
+            managerName: if (useFallback)
+                "Support Leadership"
+            else
+                managerAlerts[0].manager_name,
+
+            managerEmail: if (useFallback)
+                fallbackEmail
+            else
+                managerAlerts[0].manager_email,
+
+            runId: managerAlerts[0].run_id,
+
+            runTime: now() as String {
+                format: "yyyy-MM-dd HH:mm:ss"
+            },
+
+            escalatedCount: sizeOf(
+                (managerAlerts map ((a) -> a.ticket_id))
+                    distinctBy ((id) -> id)
+            ),
+
+            businessCalendars:
+                ((managerAlerts map ((a) -> a.business_calendar_code))
+                    distinctBy ((code) -> code))
+                    joinBy ", ",
+
+            alertSeqs: managerAlerts map ((a) -> a.alert_seq),
+
+            severeTickets:
+                digestAlerts filter ((a) -> a.band == "SEVERELY_BREACHED"),
+
+            breachedTickets:
+                digestAlerts filter ((a) -> a.band == "BREACHED"),
+
+            atRiskTickets:
+                digestAlerts filter ((a) -> a.band == "AT_RISK"),
+
+            immediateSevereTickets:
+                managerAlerts filter ((a) -> a.band == "SEVERELY_BREACHED"),
+
+            totalAlertCount: sizeOf(managerAlerts),
+            displayedAlertCount: sizeOf(digestAlerts)
+        }
+    })
+]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+				<foreach doc:name="For Each Manager Digest" doc:id="aac2e404-9cf2-4144-8e3f-5bd5a52a9ec5" collection="#[payload]">
+			<set-variable value="#[payload]" doc:name="Manager Digest" doc:id="cc495f4c-aa10-4344-9622-df2fdee20d82" variableName="managerDigest" />
+			<choice doc:name="Check Immediate Severe Notification Eligibility" doc:id="7670768e-a029-4a6b-9256-7327374f265b" >
+						<when expression="#[not (vars.currentAlert.isRecovery default false)]">
+							<foreach doc:name="For Each Severe Ticket" doc:id="a8e38edf-a75a-4899-b986-6cda48ff1232" collection="#[vars.managerDigest.immediateSevereTickets default []]">
+						<set-variable value="#[payload]" doc:name="Set Variable" doc:id="8a083cb6-d844-4387-bd94-fa738e597c79" variableName="severeTicket" />
+						<ee:transform doc:name="Transform Message" doc:id="a322a3e4-37b8-4a2b-ac15-2681d705747b">
+							<ee:message>
+								<ee:set-payload><![CDATA[%dw 2.0
+output text/plain
+
+var t = vars.severeTicket
+---
+"IMMEDIATE SEVERE SLA BREACH NOTIFICATION\n\n" ++
+"Dear " ++ ((t.manager_name default "Support Manager") as String) ++ ",\n\n" ++
+"The following ticket has reached the SEVERELY_BREACHED level and requires immediate attention.\n\n" ++
+"Ticket: " ++ ((t.ticket_id default "Unknown") as String) ++ "\n" ++
+"Subject: " ++ ((t.subject default "No subject") as String) ++ "\n" ++
+"Priority: " ++ ((t.priority default "Unknown") as String) ++ "\n" ++
+"Customer tier: " ++ ((t.customer_tier default "Unknown") as String) ++ "\n" ++
+"Clock type: " ++ ((t.clock_type default "Unknown") as String) ++ "\n" ++
+"Target: " ++ ((t.target_minutes default 0) as String) ++ " minutes\n" ++
+"Elapsed business time: " ++ ((t.elapsed_business_minutes default 0) as String) ++ " minutes\n" ++
+"Overdue by: " ++
+((max([
+    0,
+    ((t.elapsed_business_minutes default 0) as Number) -
+    ((t.target_minutes default 0) as Number)
+])) as String) ++ " minutes\n" ++
+"Assigned agent: " ++ ((t.assigned_agent_id default "Unassigned") as String) ++ "\n" ++
+"Run ID: " ++ ((vars.managerDigest.runId default "Unknown") as String) ++ "\n\n" ++
+"Regards,\nSupport Operations Monitoring"]]></ee:set-payload>
+							</ee:message>
+						</ee:transform>
+						<try doc:name="Handle Immediate Severe Email Failure">
+    <until-successful
+        doc:name="Retry Immediate Severe Email"
+        maxRetries="3"
+        millisBetweenRetries="2000">
+
+        <email:send
+            doc:name="Send Immediate Severe Email"
+            doc:id="c4d034e8-4fb2-4cbc-aa85-2a8b5c4d8a25"
+            config-ref="Email_SMTP"
+            fromAddress="${smtp.user}"
+            subject='#["IMMEDIATE SEVERE SLA BREACH – " ++ vars.severeTicket.ticket_id ++ " – " ++ vars.severeTicket.clock_type]'
+            toAddresses='#[[if (!isEmpty((vars.managerDigest.managerEmail default "") as String)) (vars.managerDigest.managerEmail as String) else p("notification.fallbackDistributionList")]]'>
+
+            <email:body contentType="text/plain" encoding="UTF-8">
+    			<email:content><![CDATA[#[payload]]]></email:content>
+			</email:body>
+            
+        </email:send>
+
+    </until-successful>
+
+    <error-handler>
+        <on-error-continue
+            type="ANY"
+            logException="true"
+            doc:name="Continue After Immediate Email Failure">
+
+            <logger
+                level="ERROR"
+                doc:name="Log Immediate Severe Email Failure"
+                message='#["Immediate severe email failed after retries for ticket " ++ ((vars.severeTicket.ticket_id default "UNKNOWN") as String) ++ ": " ++ error.description]' />
+
+        </on-error-continue>
+    </error-handler>
+</try>
+					</foreach>
+						</when>
+					</choice>
+					<choice doc:name="Check Digest Quiet Hours" doc:id="e64b88b2-a94e-4e0b-9c71-3c36c784fdae">
+							<when expression="#[(((now() &gt;&gt; 'Asia/Kolkata') as String {format: 'HH:mm'}) &gt;= p('notification.quietHoursStart')) or (((now() &gt;&gt; 'Asia/Kolkata') as String {format: 'HH:mm'}) &lt; p('notification.quietHoursEnd'))]">
+							<foreach doc:name="For Each Suppressed Digest Alert" doc:id="b6c52893-08d4-467d-8f50-4e098134a921" collection="#[vars.managerDigest.alertSeqs]">
+								<db:update doc:name="Update" doc:id="4a6b9b97-4150-43b9-9aeb-d1443758ee8f" config-ref="Database_Config">
+									<db:sql ><![CDATA[UPDATE public.sla_alert_log
+SET
+    email_status = 'SUPPRESSED',
+    suppressed_reason = 'Quiet hours'
+WHERE alert_seq = :alertSeq
+  AND email_status = 'PROCESSING'
+  AND processing_token = :claimToken;]]></db:sql>
+									<db:input-parameters ><![CDATA[#[{
+    alertSeq: payload,
+    claimToken: "RUN-" ++ (vars.currentAlert.run_id as String)
+}]]]></db:input-parameters>
+								</db:update>
+							</foreach>
+							<db:update doc:name="Increment Suppressed Digest Audit" doc:id="76581f75-0708-4278-9a36-3d01ab18b1b9" config-ref="Database_Config">
+								<db:sql ><![CDATA[UPDATE public.sla_evaluation_runs
+SET suppressed_count = COALESCE(suppressed_count, 0) + 1
+WHERE run_id = :runId;]]></db:sql>
+								<db:input-parameters ><![CDATA[#[{
+    runId: vars.managerDigest.runId as String
+}]]]></db:input-parameters>
+							</db:update>
+						</when>
+						<otherwise >
+							<ee:transform doc:name="Transform Message" doc:id="68c5de09-3802-4c1a-8bc4-63d30bd110d9">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output text/plain
+
+var d: Any = vars.managerDigest default {}
+var severe = (d["severeTickets"] default []) as Array<Any>
+var breached = (d["breachedTickets"] default []) as Array<Any>
+var atRisk = (d["atRiskTickets"] default []) as Array<Any>
+
+---
+"Dear " ++ ((d["managerName"] default "Support Manager") as String) ++ ",\n\n" ++
+"The following tickets in your team have newly crossed an SLA threshold in the evaluation completed at " ++
+((d["runTime"] default "Time unavailable") as String) ++ ".\n\n" ++
+"Run ID: " ++ ((d["runId"] default "Unknown") as String) ++ "\n" ++
+"Tickets newly escalated: " ++ ((d["escalatedCount"] default 0) as String) ++ "\n\n" ++
+
+(if (sizeOf(severe) > 0)
+    "SEVERELY BREACHED – immediate attention required\n" ++
+    ((severe map ((t) ->
+        "• " ++ ((t["ticket_id"] default "Unknown") as String) ++
+        " – " ++ ((t["priority"] default "Unknown") as String) ++
+        " – " ++ ((t["customer_tier"] default "Unknown") as String) ++
+        " – " ++ ((t["clock_type"] default "Unknown") as String) ++
+        "\n  " ++ ((t["subject"] default "No subject") as String) ++
+        "\n  Target " ++ ((t["target_minutes"] default 0) as String) ++
+        " min, elapsed " ++ ((t["elapsed_business_minutes"] default 0) as String) ++
+        " min (overdue by " ++
+        ((max([
+            0,
+            ((t["elapsed_business_minutes"] default 0) as Number) -
+            ((t["target_minutes"] default 0) as Number)
+        ])) as String) ++
+        " min), agent " ++ ((t["assigned_agent_id"] default "Unassigned") as String)
+    )) joinBy "\n") ++ "\n\n"
+else "") ++
+
+(if (sizeOf(breached) > 0)
+    "BREACHED\n" ++
+    ((breached map ((t) ->
+        "• " ++ ((t["ticket_id"] default "Unknown") as String) ++
+        " – " ++ ((t["priority"] default "Unknown") as String) ++
+        " – " ++ ((t["customer_tier"] default "Unknown") as String) ++
+        " – " ++ ((t["clock_type"] default "Unknown") as String) ++
+        "\n  " ++ ((t["subject"] default "No subject") as String) ++
+        "\n  Target " ++ ((t["target_minutes"] default 0) as String) ++
+        " min, elapsed " ++ ((t["elapsed_business_minutes"] default 0) as String) ++
+        " min (overdue by " ++
+        ((max([
+            0,
+            ((t["elapsed_business_minutes"] default 0) as Number) -
+            ((t["target_minutes"] default 0) as Number)
+        ])) as String) ++
+        " min), agent " ++ ((t["assigned_agent_id"] default "Unassigned") as String)
+    )) joinBy "\n") ++ "\n\n"
+else "") ++
+
+(if (sizeOf(atRisk) > 0)
+    "AT RISK – approaching target\n" ++
+    ((atRisk map ((t) ->
+        "• " ++ ((t["ticket_id"] default "Unknown") as String) ++
+        " – " ++ ((t["priority"] default "Unknown") as String) ++
+        " – " ++ ((t["clock_type"] default "Unknown") as String) ++
+        " – " ++
+        (if (((t["target_minutes"] default 0) as Number) > 0)
+            ((round(
+                (((t["elapsed_business_minutes"] default 0) as Number) /
+                ((t["target_minutes"] default 1) as Number)) * 100
+            )) as String)
+         else "0") ++
+        "% of target consumed, " ++
+        ((max([
+            0,
+            ((t["target_minutes"] default 0) as Number) -
+            ((t["elapsed_business_minutes"] default 0) as Number)
+        ])) as String) ++
+        " min remaining"
+    )) joinBy "\n") ++ "\n\n"
+else "") ++
+
+"Elapsed time is measured in business hours using calendar " ++
+((d["businessCalendars"] default "configured business calendar") as String) ++
+" and excludes time awaiting customer response.\n\n" ++
+"Each ticket appears in this digest only when it crosses to a higher escalation level, so a ticket already reported at this level is not repeated.\n\n" ++
+"Regards,\nSupport Operations Monitoring"]]></ee:set-payload>
+				</ee:message>
+			</ee:transform>
+							<until-successful maxRetries="3" doc:name="Retry Manager Digest Email" doc:id="0f919249-33fe-4b62-9d35-6ea1f806624e" millisBetweenRetries="2000">
+								<logger level="INFO" doc:name="Logger" doc:id="661c024e-2bb0-4f18-8886-187607e72ca7" message="ABOUT_TO_SEND_MANAGER_DIGEST_EMAIL"/>
+								<email:send doc:name="Send" doc:id="1892f83c-7d3a-49d9-a40c-234db98c4201" config-ref="Email_SMTP" fromAddress="${smtp.user}" toAddresses='#[[if (!isEmpty((vars.managerDigest.managerEmail default "") as String)) (vars.managerDigest.managerEmail as String) else p("notification.fallbackDistributionList")]]' subject='#["SLA Breach Digest – " ++ vars.managerDigest.runTime]'>
+				
+				<email:body contentType="text/plain" encoding="UTF-8">
+    				<email:content><![CDATA[#[payload]]]></email:content>
+				</email:body>
+
+			</email:send>
+							</until-successful>
+							<db:update doc:name="Increment Digest Sent Audit" doc:id="a53e1068-1b5a-46f7-b8dd-ff1921899f6e" config-ref="Database_Config">
+								<db:sql ><![CDATA[UPDATE public.sla_evaluation_runs
+SET digests_sent = COALESCE(digests_sent, 0) + 1	
+WHERE run_id = :runId;]]></db:sql>
+								<db:input-parameters ><![CDATA[#[{
+    runId: vars.managerDigest.runId as String
+}]]]></db:input-parameters>
+							</db:update>
+							<foreach doc:name="For Each Digest Alert Status Update" doc:id="e4b34cb0-4016-4839-8da9-736c1691e5b5" collection="#[vars.managerDigest.alertSeqs]">
+				<db:update doc:name="Mark Digest Alert Emailed" doc:id="b0289412-c398-441b-affb-b20345dfd8c7" config-ref="Database_Config">
+					<db:sql><![CDATA[UPDATE public.sla_alert_log
+SET email_status = 'SENT'
+WHERE alert_seq = :alertSeq
+  AND email_status = 'PROCESSING'
+  AND processing_token = :claimToken;]]></db:sql>
+					<db:input-parameters><![CDATA[#[{
+    alertSeq: payload,
+    claimToken: "RUN-" ++ (vars.currentAlert.run_id as String)
+}]]]></db:input-parameters>
+				</db:update>
+								<logger level="INFO" doc:name="Logger" doc:id="a1053005-f630-4c3c-860b-a512dae437f2" message='#[write({&#10;    message: "MARK_DIGEST_ALERT_EMAILED_RESULT",&#10;    alertSeq: payload,&#10;    runId: vars.currentAlert.run_id&#10;}, "application/json")]'/>
+			</foreach>
+						</otherwise>
+						</choice>
+		</foreach>
+			</when>
+		</choice>
+		<logger level="INFO" doc:name="Logger" doc:id="81ecd443-c206-466e-bc2c-f87e763c92f4" message='#["SLA_QUEUE_CONSUMER_RECEIVED: " ++ write(payload, "application/json")]'/>
+	</flow>
+</mule>

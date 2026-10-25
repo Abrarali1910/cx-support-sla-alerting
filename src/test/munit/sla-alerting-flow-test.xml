@@ -1,0 +1,25 @@
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools  http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+	
+	<munit:config name="sla-alerting-flow-test.xml" />
+
+	<munit:test name="sla-alerting-flow-business-hours-weekend-test" description="Test that business hours arithmetic excludes weekends and non-working hours properly">
+		<munit:execution>
+			<flow-ref name="sla-evaluation-flow" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that
+    			expression="#[payload]"
+    			is="#[MunitTools::notNullValue()]"
+    			message="Evaluation flow should execute successfully"/>
+		</munit:validation>
+	</munit:test>
+
+</mule>

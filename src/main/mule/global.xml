@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:email="http://www.mulesoft.org/schema/mule/email"
+	xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd 
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd 
+http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd 
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd">
+	
+	<db:config name="Database_Config" doc:name="Database Config" doc:id="9e81d0bc-1caf-4e40-aa8d-14c6cc4a5871" >
+		<db:generic-connection
+    url="jdbc:postgresql://${db.host}:${db.port}/${db.name}?sslmode=require"
+    driverClassName="org.postgresql.Driver"
+    user="${db.user}"
+    password="${db.password}">
+			<db:pooling-profile maxWait="30" maxIdleTime="60" testConnectionOnCheckout="false" />
+		</db:generic-connection>
+	</db:config>
+	<vm:config name="VM_Config" doc:name="VM Config" doc:id="2d4f491d-9e40-49d0-a3ce-4ca17f1f29bc" >
+		<vm:queues >
+			<vm:queue queueName="sla-alert-queue" />
+		</vm:queues>
+	</vm:config>
+	<email:smtp-config name="Email_SMTP"
+    doc:name="Email SMTP"
+    doc:id="f64d5622-6c56-4b94-a4cc-1adba6016fdf"
+    from="${smtp.user}"
+    defaultEncoding="UTF-8"
+    defaultContentTransferEncoding="Base64">
+
+    <email:smtps-connection
+        host="smtp.gmail.com"
+        port="465"
+        user="${smtp.user}"
+        password="${smtp.password}"
+        connectionTimeout="30"
+        timeoutUnit="SECONDS">
+
+        <tls:context>
+            <tls:trust-store type="bcfks" insecure="true"/>
+        </tls:context>
+
+    </email:smtps-connection>
+</email:smtp-config>
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="2b3600a4-110c-4135-9957-e4831f8e2152" >
+		<http:listener-connection host="localhost" port="8082" />
+	</http:listener-config>
+	
+	<configuration
+    	doc:name="Configuration"
+    	doc:id="c4ee7059-cf80-4c6e-afb0-49b4b1ebd1ec"
+    	defaultErrorHandler-ref="Global_SLA_Error_Handler" />
+
+	<configuration-properties
+    	doc:name="Configuration properties"
+    	doc:id="53ec245d-8f19-4fdc-a703-ea45ef7ab4e8"
+    	file="config.yaml" />
+	</mule>

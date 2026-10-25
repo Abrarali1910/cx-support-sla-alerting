@@ -1,0 +1,89 @@
+
+# CX Support SLA Breach Alerting
+# Externalized SLA policy and notification configuration
+
+businessCalendars:
+  IN_STANDARD:
+    timeZone: "Asia/Kolkata"
+    workingDays:
+      - MON
+      - TUE
+      - WED
+      - THU
+      - FRI
+    workingHours:
+      start: "09:30"
+      end: "18:30"
+    holidays:
+      - "2026-09-17"
+      - "2026-10-02"
+      - "2026-10-20"
+
+  IN_24X7:
+    timeZone: "Asia/Kolkata"
+    workingDays:
+      - MON
+      - TUE
+      - WED
+      - THU
+      - FRI
+      - SAT
+      - SUN
+    workingHours:
+      start: "00:00"
+      end: "23:59"
+
+slaPolicies:
+  - priority: P1
+    customerTier: PLATINUM
+    firstResponseTargetMins: 30
+    resolutionTargetMins: 240
+    calendar: IN_24X7
+
+  - priority: P1
+    customerTier: STANDARD
+    firstResponseTargetMins: 60
+    resolutionTargetMins: 480
+    calendar: IN_STANDARD
+
+  - priority: P2
+    customerTier: STANDARD
+    firstResponseTargetMins: 120
+    resolutionTargetMins: 1440
+    calendar: IN_STANDARD
+
+  - priority: P3
+    customerTier: STANDARD
+    firstResponseTargetMins: 480
+    resolutionTargetMins: 2880
+    calendar: IN_STANDARD
+
+thresholds:
+  atRiskPercent: 80
+  breachPercent: 100
+  severeMultiplier: 1.5
+
+escalationLevels:
+  ON_TRACK: 0
+  AT_RISK: 1
+  BREACHED: 2
+  SEVERELY_BREACHED: 3
+
+pausedStatuses:
+  - AWAITING_CUSTOMER
+  - PENDING_THIRD_PARTY
+  - ON_HOLD_APPROVED
+
+notification:
+  scheduleFrequencyMins: "15"
+  dispatchFrequencyMins: "5"
+  recoveryFrequencyMins: "5"
+  digestPerManager: true
+  immediateForSevere: true
+  quietHoursStart: "22:00"
+  quietHoursEnd: "07:30"
+  fallbackDistributionList: "support-leadership@company.com"
+  maxTicketsPerDigest: 50
+
+ticketExtraction:
+  fetchSize: "100"
